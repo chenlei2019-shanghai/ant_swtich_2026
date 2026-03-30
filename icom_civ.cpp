@@ -91,6 +91,11 @@ void icomSendCommand(uint8_t cmd, const uint8_t* data, uint8_t dataLen) {
     }
     
     frame[idx++] = ICOM_END;
+    
+    // 调试输出实际发送的地址
+    Serial.printf("[ICOM] TX: 目标地址=0x%02X, 控制器=0x%02X, 命令=0x%02X\n", 
+                  icomCfg.radioAddress, icomCfg.controllerAddress, cmd);
+    
     catHardwareWrite(frame, idx);
 }
 

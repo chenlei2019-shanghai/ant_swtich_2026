@@ -42,7 +42,7 @@
 #define ICOM_ADDR_IC9700        0xA2
 #define ICOM_ADDR_IC705         0xA4
 #define ICOM_ADDR_IC905         0xAC
-#define ICOM_ADDR_ICR30         0x9C  // IC-R30 接收机 (手册地址)
+#define ICOM_ADDR_ICR30         0xA6  // IC-R30 接收机 (手册地址)
 
 // 连接类型
 enum IcomConnType {

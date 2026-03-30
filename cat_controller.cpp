@@ -38,6 +38,10 @@ bool catControllerInit(const CatControllerConfig* config) {
         case CAT_PROTO_ICOM:
             if (!catHardwareInit(catCfg.icom.baudrate)) return false;
             {
+                LOG_I(TAG_CAT, "ICOM配置: addr=0x%02X, ctrl=0x%02X, baud=%d, conn=%d",
+                      catCfg.icom.radioAddress, ICOM_ADDR_CONTROLLER_ALT,
+                      catCfg.icom.baudrate, catCfg.icom.connType);
+                
                 IcomConfig icomCfg = {
                     .radioAddress = catCfg.icom.radioAddress,
                     .controllerAddress = ICOM_ADDR_CONTROLLER_ALT, // 使用 E5 避免冲突
@@ -46,6 +50,8 @@ bool catControllerInit(const CatControllerConfig* config) {
                     .connType = catCfg.icom.connType
                 };
                 icomInit(&icomCfg);
+                
+                LOG_I(TAG_CAT, "ICOM初始化完成，目标地址: 0x%02X", icomCfg.radioAddress);
                 // 根据连接类型设置硬件类型
                 switch (catCfg.icom.connType) {
                     case ICOM_CONN_BLE:
@@ -114,7 +120,9 @@ bool catControllerInit(const CatControllerConfig* config) {
             return false;
     }
     
-    bandCalcInit(DEFAULT_BANDS, BAND_CALC_DEFAULT_COUNT);
+    // 注意: 波段表由 antenna_switch.ino 中的 syncBandsToCatController() 管理
+    // 这里不重复初始化，避免覆盖用户配置
+    // bandCalcInit(DEFAULT_BANDS, BAND_CALC_DEFAULT_COUNT);
     initialized = true;
     return true;
 }
@@ -252,14 +260,23 @@ void catControllerProcess() {
     if (connected && frequency != 0 && frequency != catStatus.lastFrequency) {
         catStatus.lastFrequency = frequency;
         
+        LOG_I(TAG_CAT, "频率变化: %lu Hz, 自动切换=%s", frequency, catCfg.autoSwitch ? "开启" : "关闭");
+        
         if (catCfg.autoSwitch) {
             uint32_t now = millis();
             if (now - lastSwitchTime >= catCfg.switchDelay) {
                 uint8_t channel = getAntennaChannel(frequency);
-                if (channel != getCurrentChannel()) {
+                uint8_t currentCh = getCurrentChannel();
+                LOG_I(TAG_CAT, "检查切换: 目标通道=%d, 当前通道=%d", channel, currentCh);
+                if (channel != currentCh) {
+                    LOG_I(TAG_CAT, "执行切换: %d -> %d", currentCh, channel);
                     switchToChannel(channel);
                     lastSwitchTime = now;
+                } else {
+                    LOG_I(TAG_CAT, "通道相同，无需切换");
                 }
+            } else {
+                LOG_I(TAG_CAT, "切换延迟中，剩余 %lu ms", catCfg.switchDelay - (now - lastSwitchTime));
             }
         }
     }

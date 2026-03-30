@@ -211,6 +211,20 @@ class BleScanCallbacks: public BLEAdvertisedDeviceCallbacks {
         }
         
         if (name.length() > 0 || hasIC705Service) {
+            // 去重检查 - 如果设备已存在，更新RSSI（如果更强）
+            for (auto& dev : scanResults) {
+                if (dev.addr == addr) {
+                    // 更新RSSI如果新信号更强
+                    if (rssi > dev.rssi) {
+                        dev.rssi = rssi;
+                        Serial.printf("[BLE] Updated RSSI for %s: %d dBm\n", 
+                                      name.c_str(), rssi);
+                    }
+                    return;  // 已存在，跳过添加
+                }
+            }
+            
+            // 新设备，添加到列表
             Serial.print("[BLE] Found: ");
             Serial.print(name.length() > 0 ? name : "(no name)");
             Serial.print(" [");
@@ -218,16 +232,16 @@ class BleScanCallbacks: public BLEAdvertisedDeviceCallbacks {
             Serial.print("] RSSI:");
             Serial.print(rssi);
             if (hasIC705Service) {
-                Serial.print(" [IC-705]");
+                Serial.print(" [ICOM-BLE]");
             }
             Serial.println();
             
             BleDeviceInfo dev;
-            // 如果设备名称为空，但检测到IC-705服务，显示[IC-705]
+            // 如果设备名称为空，但检测到ICOM BLE服务，显示[ICOM-BLE]
             if (name.length() > 0) {
                 dev.name = name;
             } else if (hasIC705Service) {
-                dev.name = "[IC-705]";
+                dev.name = "[ICOM-BLE]";
             } else {
                 dev.name = addr;
             }
@@ -249,20 +263,43 @@ void bleCivDeinit() {
     bleCivDisconnect();
 }
 
+// 检查设备是否已在结果列表中
+static bool isDeviceInResults(const String& addr) {
+    for (const auto& dev : scanResults) {
+        if (dev.addr == addr) {
+            return true;
+        }
+    }
+    return false;
+}
+
 String bleCivScanDevices(uint32_t timeoutMs) {
     scanResults.clear();
     
     BLEScan* pBLEScan = BLEDevice::getScan();
     pBLEScan->setAdvertisedDeviceCallbacks(new BleScanCallbacks());
     pBLEScan->setActiveScan(true);
-    pBLEScan->setInterval(1349);  // From K7MDL2
-    pBLEScan->setWindow(449);     // From K7MDL2
     
-    Serial.println("[BLE] Starting scan...");
+    // 优化扫描参数 - 更密集的扫描以提高发现概率
+    // 这些参数提供更频繁的扫描窗口
+    pBLEScan->setInterval(100);   // 降低间隔，增加扫描频率
+    pBLEScan->setWindow(99);      // 接近间隔的窗口，几乎连续扫描
+    
+    Serial.printf("[BLE] Starting scan for %lu ms...\n", timeoutMs);
+    uint32_t startTime = millis();
+    
+    // 使用异步扫描，分批处理避免阻塞
     pBLEScan->start(timeoutMs / 1000, false);
-    delay(timeoutMs);
+    
+    // 分段等待，期间可以处理其他事件
+    while (millis() - startTime < timeoutMs) {
+        delay(100);
+        // 喂狗，防止看门狗复位
+        yield();
+    }
+    
     pBLEScan->stop();
-    Serial.println("[BLE] Scan complete");
+    Serial.printf("[BLE] Scan complete, found %d devices\n", scanResults.size());
     
     String json = "[";
     for (size_t i = 0; i < scanResults.size(); i++) {
@@ -303,56 +340,73 @@ static bool performIC705Pairing() {
     }
     Serial.println("[BLE] Characteristic found");
     
-    // Register for notifications
+    // 首先启用通知，确保能接收配对响应
     if (pCharacteristic->canNotify()) {
         pCharacteristic->registerForNotify(notifyCallback);
-        Serial.println("[BLE] Notifications registered");
+        // 启用通知描述符
+        pCharacteristic->getDescriptor(BLEUUID((uint16_t)0x2902))->writeValue((uint8_t*)notificationOn, 2, true);
+        Serial.println("[BLE] Notifications registered and enabled");
+        delay(100);  // 等待通知启用完成
     }
     
     // Step 1: Send UUID (41 bytes)
     Serial.println("[BLE] Step 1: Sending UUID...");
     pCharacteristic->writeValue((uint8_t*)CIV_ID0, sizeof(CIV_ID0), true);
-    delay(20);  // From K7MDL2: small delay required
+    delay(100);  // 增加延迟，等待设备响应
     
     // Step 2: Send Name (21 bytes)
     Serial.println("[BLE] Step 2: Sending device name...");
     pCharacteristic->writeValue((uint8_t*)CIV_ID1, sizeof(CIV_ID1), true);
-    delay(20);  // From K7MDL2: small delay required
+    delay(100);  // 增加延迟，等待设备响应
     
     // Step 3: Send Token (9 bytes)
     Serial.println("[BLE] Step 3: Sending pairing token...");
     pCharacteristic->writeValue((uint8_t*)CIV_ID2, sizeof(CIV_ID2), true);
-    delay(20);
+    delay(100);  // 增加延迟，等待设备处理
     
-    // Enable notifications
-    if (pCharacteristic->canNotify()) {
-        pCharacteristic->getDescriptor(BLEUUID((uint16_t)0x2902))->writeValue((uint8_t*)notificationOn, 2, true);
-    }
-    
-    // Wait for CI-V authorization (timeout 5 seconds)
+    // Wait for CI-V authorization (timeout 8 seconds - 增加超时时间)
     Serial.println("[BLE] Waiting for CI-V authorization...");
     unsigned long startTime = millis();
-    while (millis() - startTime < 5000) {
+    bool authReceived = false;
+    while (millis() - startTime < 8000) {
         if (CIV_granted) {
-            Serial.println("[BLE] Pairing completed successfully!");
-            return true;
+            authReceived = true;
+            break;
         }
         delay(10);
     }
     
-    Serial.println("[BLE] Pairing timeout - but connection established");
-    // Even if we timeout, the connection might still work
+    if (authReceived) {
+        Serial.println("[BLE] Pairing completed successfully!");
+    } else {
+        Serial.println("[BLE] Pairing timeout - no CI-V authorization");
+        Serial.printf("[BLE] Status: BT_ADDR=%d, Name=%d, Token=%d, Paired=%d\n",
+                      BT_ADDR_confirm, Name_confirm, Token_confirm, Pairing_Accepted);
+        // 没有授权，连接不可用
+        return false;
+    }
+    
     return true;
 }
 
 bool bleCivConnect(const char* deviceName) {
+    Serial.printf("[BLE] bleCivConnect called with '%s'\n", deviceName);
+    
     // Find address from scan results
     targetDeviceAddr = "";
+    Serial.printf("[BLE] scanResults.size() = %d\n", scanResults.size());
     for (auto& dev : scanResults) {
+        Serial.printf("[BLE] Checking: '%s' vs '%s' / '%s'\n", deviceName, dev.name.c_str(), dev.addr.c_str());
         if (dev.name == deviceName || dev.addr == deviceName) {
             targetDeviceAddr = dev.addr;
             break;
         }
+    }
+    
+    // 如果在扫描结果中找不到，但 deviceName 看起来像 MAC 地址，直接使用
+    if (targetDeviceAddr == "" && strlen(deviceName) == 17 && deviceName[2] == ':') {
+        Serial.println("[BLE] Using provided MAC address directly");
+        targetDeviceAddr = deviceName;
     }
     
     if (targetDeviceAddr == "") {
@@ -392,6 +446,9 @@ bool bleCivConnect(const char* deviceName) {
     } else {
         Serial.println("[BLE] CI-V authorization pending - limited functionality");
     }
+    
+    // 保存成功连接的设备地址
+    bleCivSaveLastDevice(targetDeviceAddr.c_str());
     
     Serial.println("[BLE] Ready for CI-V communication");
     return true;
@@ -567,4 +624,122 @@ int bleCivGetRSSI() {
         return pClient->getRssi();
     }
     return -100;
+}
+
+// ============ 自动重连功能 ============
+#include <Preferences.h>
+
+// 检查是否启用自动重连
+bool bleCivIsAutoReconnectEnabled() {
+    Preferences prefs;
+    prefs.begin("ble", true);
+    bool enabled = prefs.getBool("autoReconnect", true);  // 默认启用
+    prefs.end();
+    return enabled;
+}
+
+// 设置自动重连开关
+void bleCivSetAutoReconnect(bool enable) {
+    Preferences prefs;
+    prefs.begin("ble", false);
+    prefs.putBool("autoReconnect", enable);
+    prefs.end();
+    Serial.printf("[BLE] 自动重连已%s\n", enable ? "启用" : "禁用");
+}
+
+// 清除保存的设备
+void bleCivClearLastDevice() {
+    Preferences prefs;
+    prefs.begin("ble", false);
+    prefs.remove("lastDevice");
+    prefs.remove("lastConnTime");
+    prefs.end();
+    Serial.println("[BLE] 已清除保存的设备");
+}
+
+void bleCivSaveLastDevice(const char* deviceAddr) {
+    if (deviceAddr == nullptr || strlen(deviceAddr) == 0) return;
+    
+    Preferences prefs;
+    prefs.begin("ble", false);
+    prefs.putString("lastDevice", deviceAddr);
+    prefs.putUInt("lastConnTime", millis() / 1000);  // 保存连接时间戳
+    prefs.end();
+    
+    Serial.printf("[BLE] 已保存上次连接设备: %s\n", deviceAddr);
+}
+
+String bleCivGetLastDevice() {
+    Preferences prefs;
+    prefs.begin("ble", true);
+    String lastDevice = prefs.getString("lastDevice", "");
+    prefs.end();
+    return lastDevice;
+}
+
+bool bleCivAutoConnect(uint32_t scanTimeoutMs) {
+    String lastDevice = bleCivGetLastDevice();
+    Serial.printf("[BLE] bleCivAutoConnect called, lastDevice='%s', timeout=%lu\n", 
+                  lastDevice.c_str(), scanTimeoutMs);
+    
+    if (lastDevice.length() == 0) {
+        Serial.println("[BLE] 没有保存的设备，跳过自动连接");
+        return false;
+    }
+    
+    Serial.printf("[BLE] 开始自动扫描上次设备: %s (timeout=%lu ms)\n", lastDevice.c_str(), scanTimeoutMs);
+    
+    // 扫描设备 - 使用优化参数
+    scanResults.clear();
+    BLEScan* scan = BLEDevice::getScan();
+    scan->setAdvertisedDeviceCallbacks(new BleScanCallbacks());
+    scan->setActiveScan(true);
+    scan->setInterval(100);   // 优化扫描间隔
+    scan->setWindow(99);      // 接近连续扫描
+    
+    uint32_t startTime = millis();
+    scan->start(scanTimeoutMs / 1000, false);
+    
+    // 分段等待，避免阻塞
+    while (millis() - startTime < scanTimeoutMs) {
+        delay(100);
+        yield();
+    }
+    
+    scan->stop();
+    
+    // 查找上次连接的设备
+    bool found = false;
+    String targetName = "";
+    
+    for (auto& dev : scanResults) {
+        if (dev.addr == lastDevice) {
+            found = true;
+            targetName = dev.name;
+            break;
+        }
+    }
+    
+    if (!found) {
+        Serial.println("[BLE] 未找到上次连接的设备");
+        return false;
+    }
+    
+    Serial.printf("[BLE] 找到设备 %s [%s]，开始连接...\n", 
+                  targetName.c_str(), lastDevice.c_str());
+    
+    // 尝试连接
+    Serial.printf("[BLE] 调用 bleCivConnect('%s')...\n", lastDevice.c_str());
+    bool result = bleCivConnect(lastDevice.c_str());
+    if (result) {
+        Serial.println("[BLE] 自动连接成功！");
+    } else {
+        Serial.println("[BLE] 自动连接失败");
+    }
+    return result;
+}
+
+// 在连接成功后保存设备地址
+void onBleConnected(const char* deviceAddr) {
+    bleCivSaveLastDevice(deviceAddr);
 }

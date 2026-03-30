@@ -14,6 +14,7 @@
 #include "config.h"           // 统一配置头文件
 #include "cat_controller.h"
 #include "cat_hardware.h"
+#include "band_calculator.h"    // 波段计算器
 #include "ble_civ.h"
 #include "yaesu_cat.h"
 #include "kenwood_cat.h"
@@ -39,6 +40,47 @@ struct BandConfig {
 #define MAX_BANDS 20
 BandConfig bands[MAX_BANDS];
 int bandCount = 0;
+
+// CAT 控制器使用的波段表（从用户配置转换）
+static AmateurBand catBands[MAX_BANDS];
+static const char* bandNames[MAX_BANDS];  // 存储名称指针
+
+// 同步用户波段配置到 CAT 控制器
+void syncBandsToCatController() {
+  Serial.println("[SYNC] ===== 开始同步波段配置到 CAT =====");
+  Serial.printf("[SYNC] 总共有 %d 个波段配置\n", bandCount);
+  
+  int validCount = 0;
+  for (int i = 0; i < bandCount && i < MAX_BANDS; i++) {
+    Serial.printf("[SYNC] 检查波段 %d: %s, enabled=%d, ant=%d, %lu-%lu Hz\n", 
+                  i, bands[i].name, bands[i].enabled, bands[i].antenna,
+                  bands[i].minFreq, bands[i].maxFreq);
+    if (bands[i].enabled) {
+      catBands[validCount].minFreq = bands[i].minFreq;
+      catBands[validCount].maxFreq = bands[i].maxFreq;
+      catBands[validCount].antennaChannel = bands[i].antenna;
+      bandNames[validCount] = bands[i].name;  // 指向 BandConfig 的 name 数组
+      catBands[validCount].name = bandNames[validCount];
+      catBands[validCount].meter = bands[i].name;  // 使用 name 作为 meter
+      validCount++;
+    }
+  }
+  
+  if (validCount > 0) {
+    bandCalcInit(catBands, validCount);
+    LOG_I(TAG_CAT, "波段表已同步到 CAT 控制器: %d 个波段", validCount);
+    for (int i = 0; i < validCount; i++) {
+      LOG_I(TAG_CAT, "  Band %d: %s (%lu-%lu Hz) -> CH%d", 
+            i, catBands[i].name, 
+            catBands[i].minFreq, catBands[i].maxFreq,
+            catBands[i].antennaChannel);
+    }
+  } else {
+    // 没有启用波段，使用默认值
+    LOG_W(TAG_CAT, "没有启用的波段，使用默认波段表");
+  }
+  Serial.println("[SYNC] ===== 同步完成 =====");
+}
 
 // ============ 互锁保护配置 ============
 struct InterlockConfig {
@@ -258,6 +300,79 @@ void refreshVFD() {
   digitalWrite(DISP_LATCH, LOW);
 }
 
+// 启动流水灯动画 - 依次点亮每个段码
+void startupVFDAnimation() {
+  // 段码位定义 (共阳极数码管，低电平点亮)
+  // 位0: a, 位1: b, 位2: c, 位3: d, 位4: e, 位5: f, 位6: g, 位7: dp
+  const uint8_t segBits[] = {
+    0x01,  // a
+    0x02,  // b
+    0x04,  // c
+    0x08,  // d
+    0x10,  // e
+    0x20,  // f
+    0x40,  // g
+    0x80   // dp
+  };
+  
+  // 第一阶段：每个段码依次流水点亮（从右到左）
+  for (int cycle = 0; cycle < 3; cycle++) {  // 循环3次
+    for (int seg = 0; seg < 8; seg++) {  // 8个段
+      uint8_t segPattern = ~segBits[seg];  // 取反，低电平点亮
+      uint8_t buf[4] = {segPattern, segPattern, segPattern, segPattern};
+      
+      for (int i = 3; i >= 0; i--) shiftOutVFD(buf[i]);
+      digitalWrite(DISP_LATCH, HIGH);
+      digitalWrite(DISP_LATCH, LOW);
+      delay(80);  // 每个段显示80ms
+    }
+  }
+  
+  // 第二阶段：逐位点亮（从左到右跑马灯）
+  for (int cycle = 0; cycle < 2; cycle++) {
+    // 逐位点亮
+    for (int pos = 0; pos < 4; pos++) {
+      uint8_t buf[4] = {CHR_BLK, CHR_BLK, CHR_BLK, CHR_BLK};
+      buf[pos] = ~0x00;  // 全亮
+      for (int i = 3; i >= 0; i--) shiftOutVFD(buf[i]);
+      digitalWrite(DISP_LATCH, HIGH);
+      digitalWrite(DISP_LATCH, LOW);
+      delay(150);
+    }
+    // 逐位熄灭
+    for (int pos = 0; pos < 4; pos++) {
+      uint8_t buf[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+      buf[pos] = CHR_BLK;  // 熄灭
+      for (int i = 3; i >= 0; i--) shiftOutVFD(buf[i]);
+      digitalWrite(DISP_LATCH, HIGH);
+      digitalWrite(DISP_LATCH, LOW);
+      delay(100);
+    }
+  }
+  
+  // 第三阶段：全部闪烁3次
+  for (int i = 0; i < 3; i++) {
+    uint8_t allOn[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+    for (int j = 3; j >= 0; j--) shiftOutVFD(allOn[j]);
+    digitalWrite(DISP_LATCH, HIGH);
+    digitalWrite(DISP_LATCH, LOW);
+    delay(150);
+    
+    uint8_t allOff[4] = {CHR_BLK, CHR_BLK, CHR_BLK, CHR_BLK};
+    for (int j = 3; j >= 0; j--) shiftOutVFD(allOff[j]);
+    digitalWrite(DISP_LATCH, HIGH);
+    digitalWrite(DISP_LATCH, LOW);
+    delay(100);
+  }
+  
+  // 最后清空显示
+  uint8_t clearBuf[4] = {CHR_BLK, CHR_BLK, CHR_BLK, CHR_BLK};
+  for (int i = 3; i >= 0; i--) shiftOutVFD(clearBuf[i]);
+  digitalWrite(DISP_LATCH, HIGH);
+  digitalWrite(DISP_LATCH, LOW);
+  delay(100);
+}
+
 // ============ 配置加载/保存 ============
 void loadCfg() {
   prefs.begin("ant", true);
@@ -281,6 +396,9 @@ void loadCfg() {
   interlockCfg.pttReleaseDelay = prefs.getUInt("delay", 200);
   interlockCfg.relayCooldownMs = prefs.getUInt("cooldown", 100);
   prefs.end();
+  
+  // 加载CAT配置
+  loadCatConfigNVS();
 }
 
 // 加载波段配置
@@ -297,6 +415,9 @@ void loadBands() {
     }
   }
   prefs.end();
+  
+  // 同步到 CAT 控制器
+  syncBandsToCatController();
 }
 
 // 保存波段配置
@@ -308,6 +429,9 @@ void saveBands() {
     prefs.putBytes(key.c_str(), &bands[i], sizeof(BandConfig));
   }
   prefs.end();
+  
+  // 同步到 CAT 控制器
+  syncBandsToCatController();
 }
 
 // 初始化默认波段
@@ -322,10 +446,10 @@ void initDefaultBands() {
   strcpy(bands[6].name, "15m"); bands[6].minFreq = 21000000; bands[6].maxFreq = 21450000; bands[6].antenna = 5; bands[6].enabled = true;
   strcpy(bands[7].name, "12m"); bands[7].minFreq = 24890000; bands[7].maxFreq = 24990000; bands[7].antenna = 6; bands[7].enabled = true;
   strcpy(bands[8].name, "10m"); bands[8].minFreq = 28000000; bands[8].maxFreq = 29700000; bands[8].antenna = 6; bands[8].enabled = true;
-  strcpy(bands[9].name, "6m"); bands[9].minFreq = 50000000; bands[9].maxFreq = 54000000; bands[9].antenna = 0; bands[9].enabled = true;
-  strcpy(bands[10].name, "2m"); bands[10].minFreq = 144000000; bands[10].maxFreq = 148000000; bands[10].antenna = 0; bands[10].enabled = true;
-  strcpy(bands[11].name, "0.7m"); bands[11].minFreq = 430000000; bands[11].maxFreq = 450000000; bands[11].antenna = 0; bands[11].enabled = true;
-  strcpy(bands[12].name, "0.23m"); bands[12].minFreq = 1240000000; bands[12].maxFreq = 1300000000; bands[12].antenna = 0; bands[12].enabled = true;
+  strcpy(bands[9].name, "6m"); bands[9].minFreq = 50000000; bands[9].maxFreq = 54000000; bands[9].antenna = 1; bands[9].enabled = true;
+  strcpy(bands[10].name, "2m"); bands[10].minFreq = 144000000; bands[10].maxFreq = 148000000; bands[10].antenna = 2; bands[10].enabled = true;
+  strcpy(bands[11].name, "0.7m"); bands[11].minFreq = 430000000; bands[11].maxFreq = 450000000; bands[11].antenna = 3; bands[11].enabled = true;
+  strcpy(bands[12].name, "0.23m"); bands[12].minFreq = 1240000000; bands[12].maxFreq = 1300000000; bands[12].antenna = 4; bands[12].enabled = true;
   saveBands();
 }
 
@@ -342,6 +466,66 @@ void saveWiFiConfig() {
   prefs.begin("ant", false);
   prefs.putString("ssid", wifiSSID);
   prefs.putString("pass", wifiPass);
+  prefs.end();
+}
+
+// 保存CAT配置到NVS
+void saveCatConfigNVS(const CatControllerConfig* cfg) {
+  prefs.begin("cat", false);
+  prefs.putInt("proto", (int)cfg->type);
+  prefs.putBool("auto", cfg->autoSwitch);
+  prefs.putUInt("delay", cfg->switchDelay);
+  
+  if (cfg->type == CAT_PROTO_ICOM) {
+    prefs.putUInt("addr", cfg->icom.radioAddress);
+    prefs.putInt("baud", cfg->icom.baudrate);
+    prefs.putInt("conn", (int)cfg->icom.connType);
+  }
+  // 其他协议可以类似添加
+  
+  prefs.end();
+  LOG_I(TAG_CAT, "CAT配置已保存到NVS");
+}
+
+// 从NVS加载CAT配置
+void loadCatConfigNVS() {
+  prefs.begin("cat", true);
+  int proto = prefs.getInt("proto", 0);
+  
+  if (proto != 0) {
+    // 有保存的配置，初始化CAT
+    CatControllerConfig cfg;
+    cfg.type = (CatProtocolType)proto;
+    cfg.autoSwitch = prefs.getBool("auto", true);
+    cfg.switchDelay = prefs.getUInt("delay", 1000);
+    
+    if (cfg.type == CAT_PROTO_ICOM) {
+      cfg.icom.radioAddress = prefs.getUInt("addr", ICOM_ADDR_IC705);
+      cfg.icom.baudrate = prefs.getInt("baud", 115200);
+      cfg.icom.connType = (IcomConnType)prefs.getInt("conn", ICOM_CONN_BLE);
+      
+      LOG_I(TAG_CAT, "从NVS加载CAT: ICOM addr=0x%02X, baud=%d, conn=%d",
+            cfg.icom.radioAddress, cfg.icom.baudrate, cfg.icom.connType);
+      
+      // 验证地址 - IC-R30 必须是 0xA6
+      if (cfg.icom.radioAddress == 0xA6) {
+        LOG_I(TAG_CAT, "检测到IC-R30配置 (0xA6)");
+      } else if (cfg.icom.radioAddress == 0xA4) {
+        LOG_W(TAG_CAT, "当前配置为IC-705地址 (0xA4)，如使用IC-R30请重新保存配置");
+      }
+      
+      // 自动初始化CAT控制器
+      if (catControllerInit(&cfg)) {
+        LOG_I(TAG_CAT, "CAT控制器自动初始化成功");
+      } else {
+        LOG_E(TAG_CAT, "CAT控制器自动初始化失败");
+      }
+    }
+    // 其他协议可以类似添加
+  } else {
+    LOG_I(TAG_CAT, "NVS中没有CAT配置，跳过自动初始化");
+  }
+  
   prefs.end();
 }
 
@@ -956,41 +1140,70 @@ async function factoryReset(){
   await fetch('/configreset');
   alert('已恢复出厂设置，请重启设备');
 }
-let selectedBTDevice='',btConnected=false,bandConfigs=[];
+window.selDev=null;let bandConfigs=[];
 function onIcomModelChange(){const model=document.getElementById('icom-model').value;const customAddr=document.getElementById('icom-addr-custom');if(model==='custom'){customAddr.style.display='block';}else{customAddr.style.display='none';}}
 document.querySelectorAll('input[name="proto"]').forEach(r=>{r.addEventListener('change',()=>{['icom-cfg','yaesu-cfg','kenwood-cfg','elecraft-cfg','flex-cfg','bt-cfg'].forEach(id=>{const el=document.getElementById(id);if(el)el.style.display='none';});const v=r.value;if(v=='1')document.getElementById('icom-cfg').style.display='block';if(v=='2')document.getElementById('yaesu-cfg').style.display='block';if(v=='3')document.getElementById('kenwood-cfg').style.display='block';if(v=='4')document.getElementById('elecraft-cfg').style.display='block';if(v=='5')document.getElementById('flex-cfg').style.display='block';if(v=='6'){document.getElementById('bt-cfg').style.display='block';document.getElementById('icom-cfg').style.display='block';}});});
-let isScanning=false;async function btScan(){if(isScanning){console.log('Scan already in progress');return;}isScanning=true;document.getElementById('bt-list').innerHTML='<div class="status">扫描中...</div>';document.getElementById('bt-scan-btn').disabled=true;try{const r=await fetch('/btscan');const j=await r.json();let h='';j.devices.forEach((d,i)=>{h+=`<div class='device-item ${d.connected?"connected":""}' id='bt-${i}' onclick='selectBT("${d.name}",${d.connected},${i})'><span>${d.name}</span><span>${d.connected?"已连接":d.rssi+"dBm"}</span></div>`;});document.getElementById('bt-list').innerHTML=h||'<div class="status">未找到设备</div>';}catch(e){console.error('Scan error:',e);document.getElementById('bt-list').innerHTML='<div class="status">扫描出错</div>';}finally{isScanning=false;document.getElementById('bt-scan-btn').disabled=false;}}
-function selectBT(name,connected,idx){selectedBTDevice=name;btConnected=connected;document.querySelectorAll('.device-item').forEach(el=>el.classList.remove('selected'));const el=document.getElementById('bt-'+idx);if(el)el.classList.add('selected');const btn=document.getElementById('bt-conn-btn');btn.disabled=false;btn.textContent='连接选中设备';btn.style.display='inline-block';document.getElementById('bt-disc-btn').style.display='none';}
-async function btConnect(){if(!selectedBTDevice)return;document.getElementById('bt-conn-btn').textContent='连接中...';document.getElementById('bt-conn-btn').disabled=true;try{await fetch('/btconnect?name='+encodeURIComponent(selectedBTDevice));document.getElementById('bt-conn-btn').textContent='已连接';}catch(e){console.error('Connect error:',e);document.getElementById('bt-conn-btn').textContent='连接失败';}}
+async function btScan(){if(window.s)return;window.s=true;const list=document.getElementById('bt-list');list.innerHTML='<div class=status>扫描中...</div>';document.getElementById('bt-scan-btn').disabled=true;try{const r=await fetch('/btscan');const j=await r.json();console.log('Found',j.devices.length,'devices');let h='<table style=width:100%>';for(let i=0;i<j.devices.length;i++){const d=j.devices[i];const addr=d.addr||d.address;h+='<tr class=device-item onclick="pick(this)" data-addr="'+addr+'"><td>'+d.name+'</td><td style=text-align:right>'+d.rssi+'dBm</td></tr>';}h+='</table>';list.innerHTML=h;}catch(e){console.error(e);list.innerHTML='<div class=status>扫描出错</div>';}finally{window.s=false;document.getElementById('bt-scan-btn').disabled=false;}}
+function pick(el){window.curAddr=el.dataset.addr;document.querySelectorAll('.device-item').forEach(e=>e.classList.remove('selected'));el.classList.add('selected');document.getElementById('bt-conn-btn').disabled=false;console.log('Picked:',window.curAddr);}
+async function btConnect(){if(!window.curAddr){alert('请先选择设备');return;}console.log('Connect to:',window.curAddr);document.getElementById('bt-conn-btn').textContent='连接中...';document.getElementById('bt-conn-btn').disabled=true;try{await fetch('/btconnect?addr='+encodeURIComponent(window.curAddr));document.getElementById('bt-conn-btn').textContent='已连接';}catch(e){document.getElementById('bt-conn-btn').textContent='连接失败';}}
 async function btDisconnect(){await fetch('/btdisconnect');setTimeout(btScan,1000);}
 async function loadBands(){const r=await fetch('/bandconfig');const j=await r.json();bandConfigs=j.bands;renderBands();}
 function renderBands(){let h='<tr><th>波段</th><th>频率范围(MHz)</th><th>天线</th><th>操作</th></tr>';const antNames=['OPEN','CH1','CH2','CH3','CH4','CH5','CH6'];bandConfigs.forEach((b,i)=>{let opts='';for(let a=0;a<=6;a++){opts+=`<option value='${a}' ${b.ant==a?'selected':''}>${antNames[a]}</option>`;}h+=`<tr><td>${b.name}</td><td>${(b.min/1000000).toFixed(2)} - ${(b.max/1000000).toFixed(2)}</td><td><select onchange='updateBand(${i},"ant",this.value)'>${opts}</select></td><td><button class='btn btn-s btn-r' onclick='deleteBand(${i})'>删除</button></td></tr>`;});document.getElementById('band-table').innerHTML=h;}
 async function addBand(){const select=document.getElementById('new-band-select');const ant=document.getElementById('new-band-ant').value;if(!select.value){alert('请选择波段');return;}const parts=select.value.split('|');const name=parts[0],min=parseInt(parts[1]),max=parseInt(parts[2]);await fetch(`/bandadd?name=${encodeURIComponent(name)}&min=${min}&max=${max}&ant=${ant}`);select.value='';loadBands();}
-async function updateBand(idx,field,value){await fetch(`/bandupdate?idx=${idx}&field=${field}&value=${value}`);}
+async function updateBand(idx,field,value){await fetch(`/bandupdate?idx=${idx}&field=${field}&value=${value}`);console.log(`波段 ${idx} ${field} 修改为 ${value}`);}
 async function deleteBand(idx){if(!confirm('确定删除此波段配置?'))return;await fetch('/banddelete?idx='+idx);loadBands();}
 async function load(){const r=await fetch('/catstatus');const j=await r.json();document.getElementById('conn').textContent=j.connected?'已连接':'未连接';document.getElementById('conn').style.color=j.connected?'#0f0':'#f55';document.getElementById('freq').textContent=j.freq?j.freq+' Hz':'--';document.getElementById('band').textContent=j.band||'--';document.getElementById('ant').textContent=j.antenna||'--';}
-async function save(){const proto=document.querySelector('input[name="proto"]:checked').value;const auto=document.getElementById('auto-switch').checked;let url='/catsave?proto='+proto+'&auto='+(auto?1:0);if(proto=='1'){url+='&addr='+document.getElementById('icom-addr').value;url+='&baud='+document.getElementById('icom-baud').value;url+='&conn='+document.getElementById('icom-conn').value;}else if(proto=='2'){url+='&model='+document.getElementById('yaesu-model').value;url+='&baud='+document.getElementById('yaesu-baud').value;}else if(proto=='3'){url+='&model='+document.getElementById('kenwood-model').value;url+='&baud='+document.getElementById('kenwood-baud').value;}else if(proto=='4'){url+='&model='+document.getElementById('elecraft-model').value;url+='&baud='+document.getElementById('elecraft-baud').value;}else if(proto=='5'){url+='&ip='+document.getElementById('flex-ip').value;url+='&autodisc='+(document.getElementById('flex-auto').checked?1:0);}else if(proto=='6'){url+='&btdev='+encodeURIComponent(selectedBTDevice);}await fetch(url);alert('保存成功，请重启设备');}
+async function save(){const proto=document.querySelector('input[name="proto"]:checked').value;const auto=document.getElementById('auto-switch').checked;let url='/catsave?proto='+proto+'&auto='+(auto?1:0);if(proto=='1'){const model=document.getElementById('icom-model').value;url+='&model='+model;url+='&baud='+document.getElementById('icom-baud').value;url+='&conn='+document.getElementById('icom-conn').value;if(model=='custom'){url+='&custom_addr='+document.getElementById('icom-addr-input').value;}}else if(proto=='2'){url+='&model='+document.getElementById('yaesu-model').value;url+='&baud='+document.getElementById('yaesu-baud').value;}else if(proto=='3'){url+='&model='+document.getElementById('kenwood-model').value;url+='&baud='+document.getElementById('kenwood-baud').value;}else if(proto=='4'){url+='&model='+document.getElementById('elecraft-model').value;url+='&baud='+document.getElementById('elecraft-baud').value;}else if(proto=='5'){url+='&ip='+document.getElementById('flex-ip').value;url+='&autodisc='+(document.getElementById('flex-auto').checked?1:0);}else if(proto=='6'){const model=document.getElementById('icom-model').value;url+='&model='+model;url+='&btdev='+encodeURIComponent(window.d?window.d.addr:'');if(model=='custom'){url+='&custom_addr='+document.getElementById('icom-addr-input').value;}}await fetch(url);alert('保存成功，请重启设备');}
 function reboot(){if(confirm('确定要重启设备吗？'))fetch('/reboot');}
 // 加载CAT配置并设置选中状态
 async function loadCatConfig(){
   try{
+    // 从catsave接口获取详细配置
     const r=await fetch('/catstatus');
     const j=await r.json();
-    // 根据连接类型设置选中的协议
+    
+    // 根据协议和连接类型确定选中的radio
     let proto='0';
-    if(j.connType==='蓝牙BLE')proto='6';
-    else if(j.model==='ICOM')proto='1';
-    else if(j.model==='YAESU')proto='2';
-    else if(j.model==='Kenwood')proto='3';
-    else if(j.model==='Elecraft')proto='4';
-    else if(j.model==='FlexRadio')proto='5';
+    if(j.model==='ICOM'){
+      // ICOM协议：根据连接类型区分
+      if(j.connType==='蓝牙BLE' || j.bleConnected){
+        proto='6';  // 蓝牙BLE选项
+      }else{
+        proto='1';  // ICOM有线选项
+      }
+    }else if(j.model==='YAESU'){
+      proto='2';
+    }else if(j.model==='Kenwood'){
+      proto='3';
+    }else if(j.model==='Elecraft'){
+      proto='4';
+    }else if(j.model==='FlexRadio'){
+      proto='5';
+    }
+    
+    console.log('CAT config loaded:', j.model, j.connType, '-> proto', proto);
     
     const radio=document.querySelector('input[name="proto"][value="'+proto+'"]');
     if(radio){
       radio.checked=true;
       radio.dispatchEvent(new Event('change'));
+      
+      // 如果是ICOM协议，还需要设置型号下拉框
+      if(proto==='1' || proto==='6'){
+        // 尝试从配置中恢复地址设置
+        await loadIcomSettings();
+      }
     }
   }catch(e){console.error('Load CAT config error:',e);}
+}
+
+// 加载ICOM详细设置
+async function loadIcomSettings(){
+  try{
+    // 这里可以扩展为从服务器获取保存的ICOM配置
+    // 目前先根据当前地址设置下拉框
+    console.log('Loading ICOM settings...');
+  }catch(e){console.error('Load ICOM settings error:',e);}
 }
 loadBands();setInterval(load,1000);load();
 loadInterlock();setInterval(loadInterlock,1000);
@@ -1097,10 +1310,11 @@ void handleReboot() {
 }
 
 void handleBTScan() {
-  // BLE 扫描 IC-705
+  // BLE 扫描 IC-705 - 增加扫描时间到8秒以提高发现概率
   Serial.println("[BLE] Web 请求扫描设备...");
   
-  String devices = bleCivScanDevices(5000);  // 扫描5秒
+  // 连续扫描2次，每次4秒，累积结果
+  String devices = bleCivScanDevices(8000);  // 扫描8秒
   String json = "{\"devices\":" + devices + "}";
   
   Serial.print("[BLE] 扫描结果: ");
@@ -1110,13 +1324,26 @@ void handleBTScan() {
 }
 
 void handleBTConnect() {
-  if (server.hasArg("name")) {
-    String deviceName = server.arg("name");
+  Serial.println("[BT] handleBTConnect called");
+  Serial.print("[BT] hasArg('addr'): "); Serial.println(server.hasArg("addr"));
+  Serial.print("[BT] hasArg('name'): "); Serial.println(server.hasArg("name"));
+  
+  // 优先使用 addr 参数（MAC地址），如果没有则使用 name
+  String deviceAddr = "";
+  if (server.hasArg("addr")) {
+    deviceAddr = server.arg("addr");
+    Serial.print("[BT] Got addr: "); Serial.println(deviceAddr);
+  } else if (server.hasArg("name")) {
+    deviceAddr = server.arg("name");
+    Serial.print("[BT] Got name: "); Serial.println(deviceAddr);
+  }
+  
+  if (deviceAddr.length() > 0) {
     Serial.print("[BLE] 连接设备: ");
-    Serial.println(deviceName);
+    Serial.println(deviceAddr);
     
     // BLE 连接 IC-705
-    bool success = bleCivConnect(deviceName.c_str());
+    bool success = bleCivConnect(deviceAddr.c_str());
     
     // 连接成功后，初始化 CAT 控制器使用 BLE
     if (success) {
@@ -1143,7 +1370,7 @@ void handleBTConnect() {
     
     server.send(200, "text/plain", success ? "OK" : "FAIL");
   } else {
-    server.send(400, "text/plain", "Missing name");
+    server.send(400, "text/plain", "Missing addr or name");
   }
 }
 
@@ -1318,7 +1545,25 @@ void handleCatSave() {
   switch (proto) {
     case 1: { // ICOM
       catCfg.type = CAT_PROTO_ICOM;
-      catCfg.icom.radioAddress = server.hasArg("addr") ? strtol(server.arg("addr").c_str(), NULL, 16) : 0xA4;
+      
+      // 根据选择的型号设置地址
+      String model = server.hasArg("model") ? server.arg("model") : "0xA4";
+      LOG_I(TAG_CAT, "ICOM有线配置: 接收model参数='%s'", model.c_str());
+      
+      if (model == "0xA4") {
+        catCfg.icom.radioAddress = ICOM_ADDR_IC705;  // IC-705
+      } else if (model == "0xA6") {
+        catCfg.icom.radioAddress = ICOM_ADDR_ICR30;  // IC-R30
+      } else if (model == "0xA8") {
+        catCfg.icom.radioAddress = 0xA8;  // IC-R8600
+      } else if (model == "custom") {
+        // 自定义地址 - 使用输入框的值
+        String customAddr = server.hasArg("custom_addr") ? server.arg("custom_addr") : "A4";
+        catCfg.icom.radioAddress = strtol(customAddr.c_str(), NULL, 16);
+      } else {
+        catCfg.icom.radioAddress = strtol(model.c_str(), NULL, 16);
+      }
+      
       catCfg.icom.baudrate = server.hasArg("baud") ? server.arg("baud").toInt() : 9600;
       
       // 根据连接方式参数设置类型
@@ -1329,7 +1574,7 @@ void handleCatSave() {
         catCfg.icom.connType = ICOM_CONN_SERIAL;
       }
       
-      LOG_I(TAG_CAT, "配置ICOM: addr=0x%02X, baud=%d, conn=%s", 
+      LOG_I(TAG_CAT, "配置ICOM完成: addr=0x%02X, baud=%d, conn=%s", 
             catCfg.icom.radioAddress, catCfg.icom.baudrate, 
             catCfg.icom.connType == ICOM_CONN_BLE ? "BLE" : "Serial");
       break;
@@ -1404,13 +1649,28 @@ void handleCatSave() {
       break;
     }
     
-    case 6: { // 蓝牙 BLE (IC-705)
+    case 6: { // 蓝牙 BLE (支持IC-705/IC-R30等)
       catCfg.type = CAT_PROTO_ICOM;
-      catCfg.icom.radioAddress = ICOM_ADDR_IC705;
+      
+      // 根据选择的型号设置地址
+      String model = server.hasArg("model") ? server.arg("model") : "0xA4";
+      LOG_I(TAG_CAT, "BLE配置: 接收model参数='%s'", model.c_str());
+      
+      if (model == "0xA4") {
+        catCfg.icom.radioAddress = ICOM_ADDR_IC705;  // IC-705
+      } else if (model == "0xA6") {
+        catCfg.icom.radioAddress = ICOM_ADDR_ICR30;  // IC-R30
+      } else if (model == "0xA8") {
+        catCfg.icom.radioAddress = 0xA8;  // IC-R8600
+      } else {
+        catCfg.icom.radioAddress = strtol(model.c_str(), NULL, 16);
+      }
+      
       catCfg.icom.baudrate = 115200;
       catCfg.icom.connType = ICOM_CONN_BLE;
       
-      LOG_I(TAG_CAT, "配置ICOM BLE (IC-705)");
+      LOG_I(TAG_CAT, "配置ICOM BLE完成: addr=0x%02X (期望model=%s)", 
+            catCfg.icom.radioAddress, model.c_str());
       break;
     }
     
@@ -1457,6 +1717,8 @@ void handleCatSave() {
   
   if (success) {
     LOG_I(TAG_CAT, "CAT控制器初始化成功");
+    // 保存配置到NVS
+    saveCatConfigNVS(&catCfg);
     server.send(200, "text/plain", "OK");
   } else {
     LOG_E(TAG_CAT, "CAT控制器初始化失败");
@@ -1638,6 +1900,11 @@ void setup() {
   pinMode(DISP_DATA, OUTPUT); pinMode(DISP_CLK, OUTPUT); pinMode(DISP_LATCH, OUTPUT);
   LOG_I(TAG_HW, "GPIO初始化完成");
   
+  // 启动流水灯动画
+  Serial.println("[VFD] 启动流水灯动画...");
+  startupVFDAnimation();
+  Serial.println("[VFD] 动画完成");
+  
   // 加载配置
   loadCfg();
   LOG_I(TAG_MAIN, "配置加载完成");
@@ -1648,6 +1915,67 @@ void setup() {
   LOG_I(TAG_BLE, "初始化BLE客户端模式...");
   if (bleCivInit("ANT-SW")) {
     LOG_I(TAG_BLE, "BLE客户端已启动");
+    
+    // 检查是否启用自动重连
+    bool autoReconnect = bleCivIsAutoReconnectEnabled();
+    String lastDevice = bleCivGetLastDevice();
+    Serial.printf("[BLE] 自动重连状态: enabled=%d, lastDevice='%s'\n", autoReconnect, lastDevice.c_str());
+    
+    if (autoReconnect) {
+      // 检查是否有上次连接的设备，尝试自动重连
+      if (lastDevice.length() > 0) {
+        Serial.printf("[BLE] 发现上次连接设备: %s, 5秒后开始自动连接...\n", lastDevice.c_str());
+        // 延迟5秒后尝试自动连接，让系统其他部分先初始化完成
+        delay(5000);
+        Serial.println("[BLE] 开始调用 bleCivAutoConnect...");
+        if (bleCivAutoConnect(10000)) {  // 增加扫描时间到10秒
+          Serial.println("[BLE] 自动连接成功！");
+          
+          // 等待CI-V授权完成（最多5秒）
+          Serial.println("[BLE] 等待CI-V授权...");
+          uint32_t authStart = millis();
+          while (!bleCivIsAuthorized() && millis() - authStart < 5000) {
+            delay(100);
+          }
+          if (bleCivIsAuthorized()) {
+            Serial.println("[BLE] CI-V授权完成");
+          } else {
+            Serial.println("[BLE] CI-V授权未完成，继续初始化...");
+          }
+          
+          // 自动重连后，从NVS加载CAT配置并初始化
+          Serial.println("[CAT] 自动重连成功，从NVS加载CAT配置...");
+          loadCatConfigNVS();
+          
+          // 如果没有保存的CAT配置，使用默认BLE配置初始化
+          CatConnDetail connDetail = catControllerGetConnDetail();
+          if (!connDetail.initialized) {
+            Serial.println("[CAT] 没有保存的CAT配置，使用默认BLE配置初始化...");
+            CatControllerConfig defaultCfg = {
+              .type = CAT_PROTO_ICOM,
+              .autoSwitch = true,
+              .switchDelay = 1000,
+              .icom = {
+                .radioAddress = ICOM_ADDR_IC705,  // 默认IC-705地址
+                .baudrate = 115200,
+                .connType = ICOM_CONN_BLE
+              }
+            };
+            if (catControllerInit(&defaultCfg)) {
+              Serial.println("[CAT] 默认CAT配置初始化成功");
+            } else {
+              Serial.println("[CAT] 默认CAT配置初始化失败");
+            }
+          }
+        } else {
+          Serial.println("[BLE] 自动连接失败，请手动连接设备");
+        }
+      } else {
+        Serial.println("[BLE] 没有保存的设备，等待手动连接");
+      }
+    } else {
+      Serial.println("[BLE] 自动重连已禁用");
+    }
   } else {
     LOG_E(TAG_BLE, "BLE初始化失败!");
   }
@@ -1699,6 +2027,10 @@ void setup() {
   
   LOG_I(TAG_NET, "Web服务器已启动");
   LOG_I(TAG_MAIN, "系统初始化完成");
+  
+  // 显示当前通道
+  refreshVFD();
+  Serial.printf("[VFD] 显示当前通道: CH%d\n", currentCh);
   
   // 输出系统状态
   loggerPrintSystemStats();

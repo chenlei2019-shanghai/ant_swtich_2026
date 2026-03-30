@@ -70,13 +70,13 @@ const uint8_t SEG_MAP[] = {
 #define CHR_O  B11000000
 #define CHR_P  B10001100
 #define CHR_E  B10000110
-#define CHR_N  B11101100
+#define CHR_N  B11001000
 #define CHR_C  B11000110
 #define CHR_H  B10001001
 #define CHR_D  B10100001
 #define CHR_B  B10000011
 #define CHR_T  B01110001
-#define CHR_BAR B11111110
+#define CHR_BAR B10111111
 #define CHR_DP  B01111111
 #define CHR_BLK B11111111
 

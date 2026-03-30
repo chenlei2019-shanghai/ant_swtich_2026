@@ -14,7 +14,10 @@ const AmateurBand DEFAULT_BANDS[] = {
     {21000000,  21450000,  5, "15m Band",  "15m"},
     {24890000,  24990000,  6, "12m Band",  "12m"},
     {28000000,  29700000,  6, "10m Band",  "10m"},
-    {50000000,  54000000,  0, "6m Band",   "6m"},
+    {50000000,  54000000,  1, "6m Band",   "6m"},
+    {144000000, 148000000, 2, "2m Band",   "2m"},
+    {430000000, 450000000, 3, "0.7m Band", "0.7m"},
+    {1240000000, 1300000000, 4, "0.23m Band", "0.23m"},
 };
 
 const uint8_t BAND_CALC_DEFAULT_COUNT = sizeof(DEFAULT_BANDS) / sizeof(DEFAULT_BANDS[0]);
