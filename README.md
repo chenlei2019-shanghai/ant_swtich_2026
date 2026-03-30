@@ -280,8 +280,7 @@ PTT释放延迟: 200ms
 
 ## 联系方式
 
-- 项目主页: https://github.com/yourusername/ant-sw-kimicode
-- 问题反馈: https://github.com/yourusername/ant-sw-kimicode/issues
+
 
 ---
 
