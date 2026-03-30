@@ -1,0 +1,389 @@
+/**
+ * MQTT 客户端实现
+ * 
+ * 集成 Home Assistant 自动发现
+ * 主题结构:
+ * - 状态: antsw/<clientId>/status
+ * - 命令: antsw/<clientId>/command
+ * - 遗嘱: antsw/<clientId>/availability
+ * 
+ * Home Assistant 发现:
+ * - homeassistant/switch/antsw_<id>/antenna_ch1/config
+ * - homeassistant/sensor/antsw_<id>/frequency/config
+ * - homeassistant/binary_sensor/antsw_<id>/ptt/config
+ */
+
+#include "mqtt_client.h"
+#include "logger.h"
+#include "cat_controller.h"
+#include <Preferences.h>
+
+// MQTT 客户端
+static WiFiClient wifiClient;
+static PubSubClient mqttClient(wifiClient);
+
+// 配置
+static MqttConfig mqttCfg = {
+    .enabled = false,
+    .broker = "",
+    .port = 1883,
+    .username = "",
+    .password = "",
+    .clientId = "antsw-esp32",
+    .keepAlive = 60,
+    .haDiscovery = true,
+    .haPrefix = "homeassistant"
+};
+
+// HA 设备信息
+static HADeviceInfo haDevice = {
+    .identifier = "antsw-001",
+    .name = "Antenna Switch",
+    .model = "ESP32-S3-6CH",
+    .manufacturer = "Ham Radio DIY",
+    .swVersion = "1.0.0"
+};
+
+// 状态
+static bool mqttInitialized = false;
+static uint32_t lastReconnectAttempt = 0;
+static uint32_t lastActivity = 0;
+static MqttCommandCallback cmdCallback = nullptr;
+
+// 主题缓存
+static char topicStatus[64];
+static char topicCommand[64];
+static char topicAvail[64];
+
+// 构建主题
+static void buildTopics() {
+    snprintf(topicStatus, sizeof(topicStatus), "antsw/%s/status", mqttCfg.clientId);
+    snprintf(topicCommand, sizeof(topicCommand), "antsw/%s/command", mqttCfg.clientId);
+    snprintf(topicAvail, sizeof(topicAvail), "antsw/%s/availability", mqttCfg.clientId);
+}
+
+// 消息回调
+static void onMqttMessage(char* topic, byte* payload, unsigned int length) {
+    char msg[256];
+    int len = min((int)length, (int)sizeof(msg) - 1);
+    memcpy(msg, payload, len);
+    msg[len] = '\0';
+    
+    LOG_I(TAG_NET, "MQTT收到消息: %s = %s", topic, msg);
+    lastActivity = millis();
+    
+    // 处理命令
+    if (strcmp(topic, topicCommand) == 0) {
+        // 解析 JSON 命令
+        if (strncmp(msg, "{\"ant\":", 7) == 0) {
+            int ch = atoi(msg + 7);
+            LOG_I(TAG_NET, "MQTT命令: 切换到天线 %d", ch);
+            if (cmdCallback) {
+                cmdCallback("switch", msg + 7);
+            }
+        }
+        else if (strcmp(msg, "reboot") == 0) {
+            LOG_I(TAG_NET, "MQTT命令: 重启设备");
+            if (cmdCallback) {
+                cmdCallback("reboot", "");
+            }
+        }
+        else if (strncmp(msg, "{\"cat\":", 7) == 0) {
+            LOG_I(TAG_NET, "MQTT命令: 配置CAT");
+            if (cmdCallback) {
+                cmdCallback("cat_config", msg);
+            }
+        }
+    }
+}
+
+// 发布发现配置 (Home Assistant)
+static void publishHADiscoveryEntity(const char* component, const char* objectId, 
+                                      const char* name, const char* deviceClass,
+                                      const char* stateTopic, const char* cmdTopic = nullptr) {
+    char topic[128];
+    snprintf(topic, sizeof(topic), "%s/%s/antsw_%s/%s/config",
+             mqttCfg.haPrefix, component, haDevice.identifier, objectId);
+    
+    char payload[512];
+    snprintf(payload, sizeof(payload),
+        "{"
+        "\"name\":\"%s\","
+        "\"state_topic\":\"%s\","
+        "\"availability_topic\":\"%s\","
+        "\"payload_available\":\"online\","
+        "\"payload_not_available\":\"offline\","
+        "\"unique_id\":\"antsw_%s_%s\","
+        "\"device\":{"
+        "\"identifiers\":[\"%s\"],"
+        "\"name\":\"%s\","
+        "\"model\":\"%s\","
+        "\"manufacturer\":\"%s\","
+        "\"sw_version\":\"%s\""
+        "}",
+        name, stateTopic, topicAvail,
+        haDevice.identifier, objectId,
+        haDevice.identifier, haDevice.name, haDevice.model, 
+        haDevice.manufacturer, haDevice.swVersion);
+    
+    if (cmdTopic) {
+        char cmdCfg[128];
+        snprintf(cmdCfg, sizeof(cmdCfg), ",\"command_topic\":\"%s\",\"optimistic\":false", cmdTopic);
+        strncat(payload, cmdCfg, sizeof(payload) - strlen(payload) - 1);
+    }
+    
+    if (deviceClass && strlen(deviceClass) > 0) {
+        char dcCfg[64];
+        snprintf(dcCfg, sizeof(dcCfg), ",\"device_class\":\"%s\"", deviceClass);
+        strncat(payload, dcCfg, sizeof(payload) - strlen(payload) - 1);
+    }
+    
+    strncat(payload, "}", sizeof(payload) - strlen(payload) - 1);
+    
+    mqttClient.publish(topic, payload, true);  // retain = true
+    LOG_D(TAG_NET, "HA发现配置: %s", topic);
+}
+
+void mqttPublishHADiscovery() {
+    if (!mqttCfg.haDiscovery) return;
+    
+    LOG_I(TAG_NET, "发布Home Assistant自动发现配置...");
+    
+    // 天线通道选择器 (select)
+    publishHADiscoveryEntity("select", "antenna_channel", "Antenna Channel",
+                             "", topicStatus, topicCommand);
+    
+    // 频率传感器
+    publishHADiscoveryEntity("sensor", "frequency", "Frequency",
+                             "frequency", topicStatus);
+    
+    // PTT 二进制传感器
+    publishHADiscoveryEntity("binary_sensor", "ptt", "PTT Status",
+                             "power", topicAvail);
+    
+    // 连接状态
+    publishHADiscoveryEntity("binary_sensor", "cat_connected", "CAT Connected",
+                             "connectivity", topicAvail);
+    
+    LOG_I(TAG_NET, "HA发现配置已发布");
+}
+
+bool mqttInit(const MqttConfig* config) {
+    if (config) {
+        memcpy(&mqttCfg, config, sizeof(MqttConfig));
+    }
+    
+    if (!mqttCfg.enabled) {
+        LOG_I(TAG_NET, "MQTT未启用");
+        return false;
+    }
+    
+    buildTopics();
+    
+    mqttClient.setServer(mqttCfg.broker, mqttCfg.port);
+    mqttClient.setCallback(onMqttMessage);
+    mqttClient.setKeepAlive(mqttCfg.keepAlive);
+    
+    // 设置遗嘱消息 (离线时自动发布)
+    mqttClient.setWill(topicAvail, "offline", true, 0);
+    
+    mqttInitialized = true;
+    LOG_I(TAG_NET, "MQTT客户端初始化: %s:%d", mqttCfg.broker, mqttCfg.port);
+    
+    // 立即尝试连接
+    return mqttReconnect();
+}
+
+void mqttDeinit() {
+    if (mqttClient.connected()) {
+        mqttClient.publish(topicAvail, "offline", true);
+        mqttClient.disconnect();
+    }
+    mqttInitialized = false;
+}
+
+bool mqttReconnect() {
+    if (!mqttInitialized || !mqttCfg.enabled) return false;
+    
+    // 避免频繁重连
+    if (millis() - lastReconnectAttempt < 5000) return false;
+    lastReconnectAttempt = millis();
+    
+    if (mqttClient.connected()) return true;
+    
+    LOG_I(TAG_NET, "连接MQTT Broker: %s...", mqttCfg.broker);
+    
+    bool connected = false;
+    if (strlen(mqttCfg.username) > 0) {
+        connected = mqttClient.connect(mqttCfg.clientId, mqttCfg.username, 
+                                       mqttCfg.password, topicAvail, 0, true, "offline");
+    } else {
+        connected = mqttClient.connect(mqttCfg.clientId);
+    }
+    
+    if (connected) {
+        LOG_I(TAG_NET, "MQTT连接成功");
+        lastActivity = millis();
+        
+        // 发布在线状态
+        mqttClient.publish(topicAvail, "online", true);
+        
+        // 订阅命令主题
+        mqttClient.subscribe(topicCommand);
+        LOG_I(TAG_NET, "订阅主题: %s", topicCommand);
+        
+        // 发布HA发现配置
+        mqttPublishHADiscovery();
+        
+        // 立即发布一次状态
+        mqttPublishStatus();
+    } else {
+        LOG_W(TAG_NET, "MQTT连接失败, rc=%d", mqttClient.state());
+    }
+    
+    return connected;
+}
+
+void mqttProcess() {
+    if (!mqttCfg.enabled) return;
+    
+    // 保持连接
+    if (!mqttClient.connected()) {
+        mqttReconnect();
+    } else {
+        mqttClient.loop();
+    }
+}
+
+void mqttPublishStatus() {
+    if (!mqttClient.connected()) return;
+    
+    extern int currentCh;
+    extern String aliases[];
+    
+    // 构建状态 JSON
+    char payload[512];
+    snprintf(payload, sizeof(payload),
+        "{"
+        "\"ant\":%d,"
+        "\"ant_name\":\"%s\","
+        "\"freq\":%lu,"
+        "\"band\":\"%s\","
+        "\"ptt\":%s,"
+        "\"cat_connected\":%s,"
+        "\"uptime\":%lu,"
+        "\"rssi\":%d"
+        "}",
+        currentCh,
+        currentCh > 0 ? aliases[currentCh-1].c_str() : "OFF",
+        catControllerGetFrequency(),
+        catControllerGetBandName(),
+        catControllerGetPTT() ? "true" : "false",
+        catControllerIsConnected() ? "true" : "false",
+        millis() / 1000,
+        WiFi.RSSI()
+    );
+    
+    mqttClient.publish(topicStatus, payload);
+    lastActivity = millis();
+    LOG_D(TAG_NET, "发布状态: %s", payload);
+}
+
+void mqttPublishAntenna(int ch) {
+    if (!mqttClient.connected()) return;
+    
+    char payload[32];
+    snprintf(payload, sizeof(payload), "{\"ant\":%d}", ch);
+    mqttClient.publish(topicStatus, payload);
+    lastActivity = millis();
+    
+    LOG_I(TAG_NET, "MQTT发布: 天线通道=%d", ch);
+}
+
+void mqttPublishFrequency(uint32_t freq) {
+    if (!mqttClient.connected()) return;
+    
+    char payload[32];
+    snprintf(payload, sizeof(payload), "{\"freq\":%lu}", freq);
+    mqttClient.publish(topicStatus, payload);
+    lastActivity = millis();
+}
+
+void mqttPublishPTT(bool ptt) {
+    if (!mqttClient.connected()) return;
+    
+    mqttClient.publish(topicAvail, ptt ? "transmitting" : "online", true);
+    lastActivity = millis();
+}
+
+void mqttPublishConnection(bool connected) {
+    if (!mqttClient.connected()) return;
+    
+    mqttClient.publish(topicAvail, connected ? "online" : "offline", true);
+    lastActivity = millis();
+}
+
+// 配置管理
+bool mqttLoadConfig() {
+    Preferences prefs;
+    if (!prefs.begin("mqtt", true)) return false;
+    
+    mqttCfg.enabled = prefs.getBool("enabled", false);
+    prefs.getString("broker", mqttCfg.broker, sizeof(mqttCfg.broker));
+    mqttCfg.port = prefs.getUShort("port", 1883);
+    prefs.getString("username", mqttCfg.username, sizeof(mqttCfg.username));
+    prefs.getString("password", mqttCfg.password, sizeof(mqttCfg.password));
+    prefs.getString("clientId", mqttCfg.clientId, sizeof(mqttCfg.clientId));
+    mqttCfg.haDiscovery = prefs.getBool("ha_disc", true);
+    
+    prefs.end();
+    
+    // 确保 clientId 有默认值
+    if (strlen(mqttCfg.clientId) == 0) {
+        snprintf(mqttCfg.clientId, sizeof(mqttCfg.clientId), 
+                 "antsw-%04X", (uint16_t)(ESP.getEfuseMac() & 0xFFFF));
+    }
+    
+    LOG_I(TAG_NET, "MQTT配置已加载: enabled=%d", mqttCfg.enabled);
+    return true;
+}
+
+bool mqttSaveConfig() {
+    Preferences prefs;
+    if (!prefs.begin("mqtt", false)) return false;
+    
+    prefs.putBool("enabled", mqttCfg.enabled);
+    prefs.putString("broker", mqttCfg.broker);
+    prefs.putUShort("port", mqttCfg.port);
+    prefs.putString("username", mqttCfg.username);
+    prefs.putString("password", mqttCfg.password);
+    prefs.putString("clientId", mqttCfg.clientId);
+    prefs.putBool("ha_disc", mqttCfg.haDiscovery);
+    
+    prefs.end();
+    LOG_I(TAG_NET, "MQTT配置已保存");
+    return true;
+}
+
+void mqttSetConfig(const MqttConfig* config) {
+    if (config) {
+        memcpy(&mqttCfg, config, sizeof(MqttConfig));
+        buildTopics();
+    }
+}
+
+MqttConfig mqttGetConfig() {
+    return mqttCfg;
+}
+
+bool mqttIsConnected() {
+    return mqttClient.connected();
+}
+
+uint32_t mqttGetLastActivity() {
+    return lastActivity;
+}
+
+void mqttSetCommandCallback(MqttCommandCallback callback) {
+    cmdCallback = callback;
+}

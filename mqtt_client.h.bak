@@ -1,0 +1,71 @@
+/**
+ * MQTT 客户端模块
+ * 
+ * 功能:
+ * - 连接 MQTT Broker (支持用户名/密码认证)
+ * - Home Assistant 自动发现支持
+ * - 状态上报 (天线通道、频率、PTT状态)
+ * - 远程命令接收 (切换天线、配置CAT)
+ * - 遗嘱消息 (离线检测)
+ */
+
+#ifndef MQTT_CLIENT_H
+#define MQTT_CLIENT_H
+
+#include <Arduino.h>
+#include <PubSubClient.h>
+#include <WiFi.h>
+
+// MQTT 配置结构
+struct MqttConfig {
+    bool enabled;               // 是否启用
+    char broker[64];            // Broker地址
+    uint16_t port;              // 端口 (默认1883)
+    char username[32];          // 用户名 (可选)
+    char password[32];          // 密码 (可选)
+    char clientId[32];          // 客户端ID
+    uint16_t keepAlive;         // 保活时间(秒)
+    bool haDiscovery;           // Home Assistant 自动发现
+    char haPrefix[32];          // HA发现前缀 (默认 homeassistant)
+};
+
+// Home Assistant 设备信息
+struct HADeviceInfo {
+    char identifier[32];        // 设备唯一标识
+    char name[32];              // 设备名称
+    char model[32];             // 型号
+    char manufacturer[32];      // 制造商
+    char swVersion[16];         // 软件版本
+};
+
+// 初始化与配置
+bool mqttInit(const MqttConfig* config);
+void mqttDeinit();
+bool mqttReconnect();
+void mqttProcess();  // 在 loop() 中调用
+
+// 配置管理
+void mqttSetConfig(const MqttConfig* config);
+MqttConfig mqttGetConfig();
+bool mqttLoadConfig();   // 从 NVS 加载
+bool mqttSaveConfig();   // 保存到 NVS
+
+// 状态发布
+void mqttPublishStatus();           // 发布所有状态
+void mqttPublishAntenna(int ch);    // 发布天线通道
+void mqttPublishFrequency(uint32_t freq); // 发布频率
+void mqttPublishPTT(bool ptt);      // 发布PTT状态
+void mqttPublishConnection(bool connected); // 发布连接状态
+
+// Home Assistant 自动发现
+void mqttPublishHADiscovery();      // 发布发现配置
+
+// 检查连接状态
+bool mqttIsConnected();
+uint32_t mqttGetLastActivity();
+
+// 回调函数类型
+typedef void (*MqttCommandCallback)(const char* command, const char* payload);
+void mqttSetCommandCallback(MqttCommandCallback callback);
+
+#endif // MQTT_CLIENT_H
